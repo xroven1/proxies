@@ -1,0 +1,42 @@
+name: Pool Doctor
+
+# Runs every 30 min + manual "Run workflow" button (mobile-friendly).
+# Sends ONE health-report embed to your Discord each run AND
+# auto-prunes dead IPs: marks them alive:false in proxies.json and
+# commits the update -> every tool stops using dead IPs within 60s.
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch: {}
+
+# needed so the doctor can commit the pruned proxies.json back
+permissions:
+  contents: write
+
+concurrency:
+  group: pool-doctor
+  cancel-in-progress: false
+
+jobs:
+  doctor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Run Pool Doctor
+        env:
+          # Optional overrides (set in repo Settings -> Secrets and
+          # variables -> Actions). All have working defaults:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          ROBLOX_COOKIE: ${{ secrets.ROBLOX_COOKIE }}
+          BYPASS_URL: ${{ secrets.BYPASS_URL }}
+        run: python doctor.py
