@@ -1,4 +1,4 @@
-// proxy-manager.js
+// proxy-manager.js (Hardened Diagnostic Edition)
 import { ProxyAgent } from 'undici';
 
 const WEBHOOK_URL = "https://discord.com/api/webhooks/1553383042767265912/Ln_8PuRiK4FuhyWtP7pqj8PDxPt1VxU4rL5-EPxVFgufaAsbXJ-arQSr_e1JWOB46vEc";
@@ -6,79 +6,54 @@ const PROXIES_GITHUB_URL = "https://raw.githubusercontent.com/xroven1/proxies/ma
 
 let cachedProxies = [];
 let lastLoad = 0;
-const CACHE_TTL = 300000;
-const failedCounts = {};
+const CACHE_TTL = 60000; 
 
 export async function getProxyDispatcher() {
   const now = Date.now();
   if (now - lastLoad > CACHE_TTL || cachedProxies.length === 0) {
     try {
-      const res = await fetch(PROXIES_GITHUB_URL);
+      const res = await fetch(PROXIES_GITHUB_URL + "?cache_bust=" + now);
       if (res.ok) {
         const data = await res.json();
         cachedProxies = data.proxies || [];
         lastLoad = now;
+        console.log(`[PROXY MANAGER] Loaded ${cachedProxies.length} proxies from GitHub.`);
       }
     } catch (e) {
       console.error('[PROXY FETCH ERROR]', e.message);
     }
   }
 
-  if (cachedProxies.length === 0) return null;
+  if (cachedProxies.length === 0) {
+    console.warn('[PROXY MANAGER] Pool empty! Falling back to direct connection.');
+    return { agent: null, proxyIp: 'DIRECT (No Proxy)' };
+  }
 
-  let alive = cachedProxies.filter(p => p.alive !== false && (p.success_rate ?? 1.0) >= 0.5);
-  if (alive.length === 0) alive = cachedProxies;
-
-  const proxy = alive[Math.floor(Math.random() * alive.length)];
+  const proxy = cachedProxies[Math.floor(Math.random() * cachedProxies.length)];
   const agent = new ProxyAgent(proxy.url);
-  agent.proxyIp = proxy.ip;
-  agent.proxyUrl = proxy.url;
-  return agent;
+  return { agent, proxyIp: proxy.ip || 'Unknown IP' };
 }
 
-export function reportProxyFailure(agent, status, reason) {
-  if (!agent || !agent.proxyIp) return;
-  const key = `${agent.proxyIp} (${status || 'ERR'})`;
-  failedCounts[key] = (failedCounts[key] || 0) + 1;
-}
-
-export async function sendProxyAnalyticsReport(actionName = "Routine Check", statusDetails = null) {
+export async function sendDiagnosticLog(title, description, isError = false, fields = []) {
   try {
-    const res = await fetch(PROXIES_GITHUB_URL);
-    if (!res.ok) return;
-    const data = await res.json();
-    const proxies = data.proxies || [];
-    const total = proxies.length;
-
-    let aliveCount = proxies.filter(p => p.alive !== false).length;
-    let deadCount = total - aliveCount;
-
-    const failedLogFormatted = Object.keys(failedCounts).length > 0
-      ? Object.entries(failedCounts).map(([k, v]) => `${k}: ${v} failures`).join('\n')
-      : 'No failure logs captured.';
-
     const embed = {
-      title: `📊 Proxy Sentinel — ${actionName}`,
-      color: 65280,
-      fields: [
-        { name: "📦 Total Proxies", value: "`" + total + "`", inline: true },
-        { name: "🟢 Alive", value: "`" + aliveCount + "`", inline: true },
-        { name: "🔴 Dead", value: "`" + deadCount + "`", inline: true },
-        { name: "⚠️ Error Logs", value: "```" + failedLogFormatted.slice(0, 900) + "```", inline: false }
-      ],
+      title: `🛠️ [Diagnostic] ${title}`,
+      description: String(description).slice(0, 4000),
+      color: isError ? 16711680 : 65280,
+      fields: fields,
       timestamp: new Date().toISOString()
     };
 
-    if (statusDetails) {
-      embed.fields.unshift({ name: "📌 Status Details", value: String(statusDetails), inline: false });
-    }
-
-    await fetch(WEBHOOK_URL, {
+    const res = await fetch(WEBHOOK_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: "Noctrya Proxy Monitor", embeds: [embed] })
+      body: JSON.stringify({ username: "Noctrya Diagnostics", embeds: [embed] })
     });
+    
+    if (!res.ok) {
+      console.error('[WEBHOOK FAIL]', res.status, await res.text());
+    }
   } catch (e) {
-    console.error('[ANALYTICS ERROR]', e.message);
+    console.error('[WEBHOOK EXCEPTION]', e.message);
   }
 }
