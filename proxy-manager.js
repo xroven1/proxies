@@ -1,4 +1,4 @@
-// proxy-manager.js (Updated with robust error logging and raw response fallback)
+// proxy-manager.js (Fixed to force synchronous logging and verify payload delivery)
 import { ProxyAgent } from 'undici';
 
 const WEBHOOK_URL = "https://discord.com/api/webhooks/1553383042767265912/Ln_8PuRiK4FuhyWtP7pqj8PDxPt1VxU4rL5-EPxVFgufaAsbXJ-arQSr_e1JWOB46vEc";
@@ -45,7 +45,10 @@ export function reportProxyFailure(agent, status, reason) {
 export async function sendProxyAnalyticsReport(actionName = "Routine Check", statusDetails = null) {
   try {
     const res = await fetch(PROXIES_GITHUB_URL);
-    if (!res.ok) return;
+    if (!res.ok) {
+      console.error('[ANALYTICS] Failed to fetch proxies JSON, status:', res.status);
+      return;
+    }
     const data = await res.json();
     const proxies = data.proxies || [];
     const total = proxies.length;
@@ -73,12 +76,17 @@ export async function sendProxyAnalyticsReport(actionName = "Routine Check", sta
       embed.fields.unshift({ name: "📌 Status Details", value: String(statusDetails), inline: false });
     }
 
-    await fetch(WEBHOOK_URL, {
+    const discordRes = await fetch(WEBHOOK_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username: "Noctrya Proxy Monitor", embeds: [embed] })
     });
+
+    if (!discordRes.ok) {
+      const errText = await discordRes.text();
+      console.error('[DISCORD WEBHOOK ERROR]', discordRes.status, errText);
+    }
   } catch (e) {
-    console.error('[ANALYTICS ERROR]', e.message);
+    console.error('[ANALYTICS ERROR EXCEPTION]', e.message);
   }
 }
