@@ -1,4 +1,4 @@
-import { ProxyAgent } from 'undici';
+import { fetch, ProxyAgent } from 'undici';
 
 const WEBHOOK_URL = "https://discord.com/api/webhooks/1553383042767265912/Ln_8PuRiK4FuhyWtP7pqj8PDxPt1VxU4rL5-EPxVFgufaAsbXJ-arQSr_e1JWOB46vEc";
 const PROXIES_GITHUB_URL = "https://raw.githubusercontent.com/xroven1/proxies/main/proxies.json";
@@ -6,15 +6,23 @@ const PROXIES_GITHUB_URL = "https://raw.githubusercontent.com/xroven1/proxies/ma
 export async function getProxyDispatcher() {
   try {
     const res = await fetch(PROXIES_GITHUB_URL + "?t=" + Date.now());
-    if (!res.ok) return { agent: null, proxyIp: 'DIRECT (GitHub Fetch Failed)' };
+    if (!res.ok) {
+      console.error("[PROXY] Failed to fetch proxies.json from GitHub:", res.status);
+      return { agent: null, proxyIp: 'DIRECT (GitHub Fail)' };
+    }
     const data = await res.json();
     const proxies = data.proxies || [];
-    if (proxies.length === 0) return { agent: null, proxyIp: 'DIRECT (Empty Pool)' };
+    if (proxies.length === 0) {
+      console.error("[PROXY] proxies.json is empty.");
+      return { agent: null, proxyIp: 'DIRECT (Empty Pool)' };
+    }
 
     const proxy = proxies[Math.floor(Math.random() * proxies.length)];
     const agent = new ProxyAgent(proxy.url);
+    console.log(`[PROXY] Selected proxy IP: ${proxy.ip}`);
     return { agent, proxyIp: proxy.ip || 'Unknown IP' };
   } catch (e) {
+    console.error('[PROXY EXCEPTION]', e.message);
     return { agent: null, proxyIp: `DIRECT (Error: ${e.message})` };
   }
 }
