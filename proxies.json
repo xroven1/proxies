@@ -9,7 +9,7 @@
       "alive": true,
       "speed_ms": 240,
       "bypasses_403": true,
-      "last_check": 1777478580,
+      "last_check": 1793228264,
       "success_rate": 1.0
     },
     {
@@ -18,11 +18,11 @@
       "user": "eswpmeic",
       "pass": "fkejzjjoql9w",
       "url": "http://eswpmeic:fkejzjjoql9w@142.111.67.146:5611",
-      "alive": true,
+      "alive": false,
       "speed_ms": 215,
       "bypasses_403": true,
-      "last_check": 1777478580,
-      "success_rate": 1.0
+      "last_check": 1793228264,
+      "success_rate": 0.0
     },
     {
       "ip": "191.96.254.138",
@@ -33,7 +33,7 @@
       "alive": true,
       "speed_ms": 198,
       "bypasses_403": true,
-      "last_check": 1777478580,
+      "last_check": 1793228264,
       "success_rate": 1.0
     },
     {
@@ -45,7 +45,7 @@
       "alive": true,
       "speed_ms": 230,
       "bypasses_403": true,
-      "last_check": 1777478580,
+      "last_check": 1793228264,
       "success_rate": 1.0
     },
     {
@@ -57,7 +57,7 @@
       "alive": true,
       "speed_ms": 210,
       "bypasses_403": true,
-      "last_check": 1777478580,
+      "last_check": 1793228264,
       "success_rate": 1.0
     },
     {
@@ -66,11 +66,11 @@
       "user": "eswpmeic",
       "pass": "fkejzjjoql9w",
       "url": "http://eswpmeic:fkejzjjoql9w@31.59.20.176:6754",
-      "alive": true,
+      "alive": false,
       "speed_ms": 185,
       "bypasses_403": true,
-      "last_check": 1777478580,
-      "success_rate": 1.0
+      "last_check": 1793228264,
+      "success_rate": 0.0
     },
     {
       "ip": "38.154.185.97",
@@ -81,7 +81,7 @@
       "alive": true,
       "speed_ms": 195,
       "bypasses_403": true,
-      "last_check": 1777478580,
+      "last_check": 1793228264,
       "success_rate": 1.0
     },
     {
@@ -93,14 +93,14 @@
       "alive": true,
       "speed_ms": 205,
       "bypasses_403": true,
-      "last_check": 1777478580,
+      "last_check": 1793228264,
       "success_rate": 1.0
     }
   ],
   "metadata": {
     "total": 8,
-    "alive": 8,
-    "dead": 0,
-    "updated_at": 1777478580
+    "alive": 6,
+    "dead": 2,
+    "updated_at": 1793228264
   }
 }
