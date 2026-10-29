@@ -1,5 +1,11 @@
 // ═══════════════════════════════════════════════════════════════════
-//  proxy-manager.js — CENTRAL PROXY ENGINE (v4 — REMOTE-LOAD FACTORY)
+//  proxy-manager.js — CENTRAL PROXY ENGINE (v5 — CSRF-AWARE ROTATION)
+//  v5 FIX: HTTP 403 + X-CSRF-TOKEN header = Roblox CSRF-dance response
+//  (the app ANSWERED — normal for authed POSTs without a token).
+//  v4 wrongly rotated on it, discarding 4 good tokens, then falling
+//  back to DIRECT (whose 403 has NO token from Vercel egress) — which
+//  broke getCsrfToken() in every tool. WAF challenges NEVER carry
+//  x-csrf-token, so this check cannot mask real blocks.
 //  Lives ONLY in the proxies-main repo. Tool repos load this file at
 //  runtime via their tiny proxy-loader.js (fetch → /tmp → import) and
 //  call:  initEngine({ require, fetch })
@@ -167,6 +173,15 @@ export function initEngine({ require, fetch = globalThis.fetch }) {
         const res = await fetch(url, { ...opts, signal: opts.signal || AbortSignal.timeout(REQ_TIMEOUT_MS) });
         const ms = Date.now() - t0;
 
+        // ── v5: CSRF-dance responses are SUCCESS, not blocks ─────────
+        // authed POST without token → 403 + X-CSRF-TOKEN = correct answer.
+        // Cloudflare/WAF challenge 403s never include x-csrf-token.
+        if (res.status === 403 && res.headers.get('x-csrf-token')) {
+          if (proxy) track(proxy, 'ok', ms);
+          log(`✓ ${label} → ${targetHost} via ${usedIp} → HTTP 403 (CSRF token issued) — returning response`);
+          return res;
+        }
+
         if (res.status === 403 || res.status === 429) {
           if (proxy) track(proxy, res.status === 403 ? 'c403' : 'c429', ms);
           log(`⚠ ${label} → ${targetHost} via ${usedIp} → HTTP ${res.status} — rotating${i + 1 < MAX_ROTATIONS ? ' to next proxy' : ' (last try)'} [attempt ${i + 1}/${MAX_ROTATIONS}]`);
@@ -195,7 +210,7 @@ export function initEngine({ require, fetch = globalThis.fetch }) {
         const res = await fetch(url, { ...options, signal: options.signal || AbortSignal.timeout(REQ_TIMEOUT_MS) });
         const ms = Date.now() - t0;
         log(`✓ ${label} → ${targetHost} via DIRECT → HTTP ${res.status} (${ms}ms) [proxy pool exhausted]`);
-        if (!res.ok && (res.status === 403 || res.status === 429)) {
+        if (!res.ok && (res.status === 403 || res.status === 429) && !res.headers.get('x-csrf-token')) {
           fire403Alert(`${label} — ALL PROXIES 403`, `Target: \`${targetHost}\`\nTried **${Math.min(MAX_ROTATIONS, total)}** proxies (last: \`${usedIp}\`) + DIRECT.\nFinal status: \`${res.status}\`\n→ Pool may need fresh IPs.`, 16711680);
         }
         return res;
@@ -215,7 +230,7 @@ export function initEngine({ require, fetch = globalThis.fetch }) {
     if (now - (lastAlertAt.get(key) || 0) < ALERT_COOLDOWN) return;
     lastAlertAt.set(key, now);
     sendDiscordLog(title, desc, color, [
-      { name: 'Engine', value: 'Proxy Rotation v4', inline: true },
+      { name: 'Engine', value: 'Proxy Rotation v5', inline: true },
       { name: 'Pool Size', value: String(poolCache.proxies.length), inline: true }
     ]);
   }
@@ -281,7 +296,7 @@ export function initEngine({ require, fetch = globalThis.fetch }) {
               ...rows
             ],
             timestamp: new Date().toISOString(),
-            footer: { text: 'Proxy Rotation Engine v4 • 403-aware' }
+            footer: { text: 'Proxy Rotation Engine v5 • 403-aware • CSRF-aware' }
           }]
         })
       });
