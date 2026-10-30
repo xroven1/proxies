@@ -9,7 +9,7 @@
       "alive": true,
       "speed_ms": 240,
       "bypasses_403": true,
-      "last_check": 1793366185,
+      "last_check": 1793385755,
       "success_rate": 1.0
     },
     {
@@ -21,7 +21,7 @@
       "alive": false,
       "speed_ms": 215,
       "bypasses_403": true,
-      "last_check": 1793366185,
+      "last_check": 1793385755,
       "success_rate": 0.0
     },
     {
@@ -33,7 +33,7 @@
       "alive": true,
       "speed_ms": 198,
       "bypasses_403": true,
-      "last_check": 1793366185,
+      "last_check": 1793385755,
       "success_rate": 1.0
     },
     {
@@ -45,7 +45,7 @@
       "alive": true,
       "speed_ms": 230,
       "bypasses_403": true,
-      "last_check": 1793366185,
+      "last_check": 1793385755,
       "success_rate": 1.0
     },
     {
@@ -57,7 +57,7 @@
       "alive": true,
       "speed_ms": 210,
       "bypasses_403": true,
-      "last_check": 1793366185,
+      "last_check": 1793385755,
       "success_rate": 1.0
     },
     {
@@ -69,7 +69,7 @@
       "alive": false,
       "speed_ms": 185,
       "bypasses_403": true,
-      "last_check": 1793366185,
+      "last_check": 1793385755,
       "success_rate": 0.0
     },
     {
@@ -81,7 +81,7 @@
       "alive": true,
       "speed_ms": 195,
       "bypasses_403": true,
-      "last_check": 1793366185,
+      "last_check": 1793385755,
       "success_rate": 1.0
     },
     {
@@ -93,7 +93,7 @@
       "alive": true,
       "speed_ms": 205,
       "bypasses_403": true,
-      "last_check": 1793366185,
+      "last_check": 1793385755,
       "success_rate": 1.0
     }
   ],
@@ -101,6 +101,6 @@
     "total": 8,
     "alive": 6,
     "dead": 2,
-    "updated_at": 1793366185
+    "updated_at": 1793385755
   }
 }
