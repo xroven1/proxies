@@ -1,58 +1,107 @@
 // ═══════════════════════════════════════════════════════════════════
-//  proxy-manager.js — CENTRAL PROXY ENGINE (v5 — CSRF-AWARE ROTATION)
-//  v5 FIX: HTTP 403 + X-CSRF-TOKEN header = Roblox CSRF-dance response
-//  (the app ANSWERED — normal for authed POSTs without a token).
-//  v4 wrongly rotated on it, discarding 4 good tokens, then falling
-//  back to DIRECT (whose 403 has NO token from Vercel egress) — which
-//  broke getCsrfToken() in every tool. WAF challenges NEVER carry
-//  x-csrf-token, so this check cannot mask real blocks.
+//  proxy-manager.js — CENTRAL PROXY ENGINE (v6 — VERCEL-PROOF + REAL ERRORS)
+//
+//  v6 changes (why "CSRF failed" kept happening on Vercel while local
+//  tests were green):
+//   1. UNDICI PARITY: proxied requests now use the SAME undici module's
+//      own `fetch` as the ProxyAgent (injected from the tool repo via a
+//      STATIC import — guaranteed to exist at build time). Before, the
+//      engine mixed Node-core fetch (Node 20 bundles undici 5.x) with a
+//      node_modules undici 6.x ProxyAgent. On some Vercel runtimes the
+//      dispatcher was silently IGNORED → every "proxied" request
+//      actually went DIRECT from Vercel's egress IP → Roblox WAF 403
+//      (no x-csrf-token) on all rotations → "CSRF failed" everywhere.
+//   2. DEGRADED-MODE ALERT: if no ProxyAgent can be built, one clear
+//      Discord alert fires ("ENGINE DEGRADED — going DIRECT") instead of
+//      a silent console.error nobody sees.
+//   3. REAL ERRORS: proxyFetch attaches a verbatim attempt trail
+//      (per-IP status / network error / body snippet) to thrown errors
+//      via `err.attempts`, and supports `options._trail` arrays. New
+//      built-in getCsrfToken(cookie, label) returns
+//      { ok, token, status, attempts } — tools surface these verbatim.
+//   4. v5's CSRF-dance behavior kept: 403 + x-csrf-token = SUCCESS
+//      (Roblox answered the POST — that IS the token handout).
+//
 //  Lives ONLY in the proxies-main repo. Tool repos load this file at
 //  runtime via their tiny proxy-loader.js (fetch → /tmp → import) and
-//  call:  initEngine({ require, fetch })
-//
-//  ZERO top-level imports on purpose: the file is dynamic-imported from
-//  /tmp on Vercel, where 'undici' is NOT resolvable. Instead the loader
-//  passes its own createRequire (anchored inside the tool's bundle), so
-//  undici / fs / path resolve from the TOOL's node_modules.
+//  call:  initEngine({ require, fetch, undici })
 //
 //  Returns:
 //    proxyFetch(url, opts, label)  -> smart fetch: routes through the
-//      proxy pool, auto-ROTATES to a fresh proxy on 403/429/network
-//      error, logs every hop (console + Discord), tracks analytics.
+//      proxy pool, auto-ROTATES on 403/429/network error, logs every
+//      hop (console + Discord), tracks analytics, fills opts._trail.
+//    getCsrfToken(cookie, label)   -> { ok, token, status, attempts }
 //    getProxyDispatcher()          -> { agent, proxyIp }
 //    sendDiscordLog(title, desc, color, fields)
-//    sendProxyAnalyticsReport()    -> aggregated pool stats to Discord
+//    sendProxyAnalyticsReport()
 // ═══════════════════════════════════════════════════════════════════
 
-export function initEngine({ require, fetch = globalThis.fetch }) {
-  // ── deps resolved through the caller's require (works on Vercel) ──
+export function initEngine({ require, fetch = globalThis.fetch, undici = null }) {
+  // ── deps: injected undici wins, then require(), then degraded mode ──
   let ProxyAgent = null;
-  try { ({ ProxyAgent } = require('undici')); } catch { /* direct-only fallback */ }
+  let routeFetch = fetch;          // fetch used for POOL-ROUTED requests
+  let undiciSource = 'global fetch';
+
+  if (undici && typeof undici.ProxyAgent === 'function') {
+    ProxyAgent = undici.ProxyAgent;
+    if (typeof undici.fetch === 'function') { routeFetch = undici.fetch; undiciSource = 'injected undici'; }
+  } else if (typeof require === 'function') {
+    try {
+      const u = require('undici');
+      if (u && typeof u.ProxyAgent === 'function') {
+        ProxyAgent = u.ProxyAgent;
+        if (typeof u.fetch === 'function') { routeFetch = u.fetch; undiciSource = 'require(undici)'; }
+      }
+    } catch { /* degraded mode below */ }
+  }
+
   let fs = null, path = null;
   try { fs = require('fs'); } catch {}
   try { path = require('path'); } catch {}
 
   const WEBHOOK_URL = "https://discord.com/api/webhooks/1553383042767265912/Ln_8PuRiK4FuhyWtP7pqj8PDxPt1VxU4rL5-EPxVFgufaAsbXJ-arQSr_e1JWOB46vEc";
   const PROXIES_GITHUB_URL = "https://raw.githubusercontent.com/xroven1/proxies/main/proxies.json";
+  const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
   // ── Tunables ──────────────────────────────────────────────────────
   const POOL_CACHE_TTL   = 60_000;   // re-pull proxies.json every 60s
-  const MAX_ROTATIONS    = 4;        // tries per request before giving up on pool
-  const ROTATE_DELAY_MS  = 250;      // small pause between rotated attempts
-  const DIRECT_FALLBACK  = true;     // final try without proxy if pool exhausted
-  const ALERT_COOLDOWN   = 20_000;   // Discord 403-alert min gap per target host
-  const REQ_TIMEOUT_MS   = 15_000;   // per-attempt abort timeout
+  const MAX_ROTATIONS    = 4;        // pool tries per request before DIRECT
+  const ROTATE_DELAY_MS  = 200;      // pause between rotated attempts
+  const DIRECT_FALLBACK  = true;     // final try without proxy
+  const ALERT_COOLDOWN   = 20_000;   // Discord alert min gap per key
+  const REQ_TIMEOUT_MS   = 12_000;   // per-attempt abort timeout
 
   // ── State ─────────────────────────────────────────────────────────
   let poolCache = { proxies: [], fetchedAt: 0 };
-  const agentCache = new Map();          // proxyUrl -> ProxyAgent
-  const stats = new Map();               // proxyIp -> {req, ok, c403, c429, err, ms}
-  const lastAlertAt = new Map();         // alertKey -> ts (throttle)
+  const agentCache = new Map();
+  const stats = new Map();
+  const lastAlertAt = new Map();
+  let degradedAlerted = false;       // one Discord alert per lambda life
 
   function log(...a)    { console.log('[PROXY]', ...a); }
   function logErr(...a) { console.error('[PROXY]', ...a); }
 
-  if (!ProxyAgent) logErr('undici not found via require() — pool routing degraded to DIRECT-only. Add "undici" to dependencies.');
+  // ═══ DEGRADED-MODE ALERT (the silent killer, made loud) ═══════════
+  function degradedMode(reason) {
+    logErr(`⚠️ ENGINE DEGRADED — ${reason}`);
+    logErr('⚠️ ALL requests now go DIRECT from this server IP. Roblox WAF will 403 them → tools will report CSRF failures.');
+    logErr('⚠️ Fix: ensure "undici" is in the tool repo package.json + REDEPLOY (static import in proxy-loader.js v3+ prevents this).');
+    if (degradedAlerted) return;
+    degradedAlerted = true;
+    sendDiscordLog(
+      '⚠️ PROXY ENGINE DEGRADED',
+      '**No undici ProxyAgent available in this lambda.**\n' +
+      'Every request is going **DIRECT from the server IP** — Roblox WAF blocks those, so all tools will fail CSRF/auth steps.\n' +
+      `Reason: \`${reason}\`\n` +
+      '**Fix:** redeploy the tool repo (proxy-loader v3 imports undici statically so it can never go missing).',
+      16756448,
+      [{ name: 'Route fetch', value: 'global fetch (DIRECT only)', inline: true },
+       { name: 'Pool', value: 'loaded but unusable', inline: true }]
+    );
+  }
+
+  if (!ProxyAgent) degradedMode(undici ? 'injected module has no ProxyAgent' : 'neither injected undici nor require("undici") resolved');
+  else log(`Engine v6 booted — ProxyAgent + route fetch from ${undiciSource}`);
 
   // ═══ POOL LOADING ═════════════════════════════════════════════════
   async function loadPool(force = false) {
@@ -62,7 +111,7 @@ export function initEngine({ require, fetch = globalThis.fetch }) {
     }
     try {
       const res = await fetch(PROXIES_GITHUB_URL + '?t=' + now, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36' },
+        headers: { 'User-Agent': BROWSER_UA },
         signal: AbortSignal.timeout(8000)
       });
       if (!res.ok) throw new Error('GitHub HTTP ' + res.status);
@@ -76,8 +125,7 @@ export function initEngine({ require, fetch = globalThis.fetch }) {
       throw new Error('proxies.json empty');
     } catch (e) {
       logErr('GitHub pool fetch failed:', e.message);
-      if (poolCache.proxies.length) { poolCache.fetchedAt = now; return poolCache.proxies; } // stale cache better than nothing
-      // ── local file fallback (repo checkout / tmp copies) ──
+      if (poolCache.proxies.length) { poolCache.fetchedAt = now; return poolCache.proxies; }
       const candidates = [];
       if (fs && path) {
         candidates.push(path.join(process.cwd(), 'proxies.json'),
@@ -107,11 +155,10 @@ export function initEngine({ require, fetch = globalThis.fetch }) {
     const k = statKey(p);
     const s = stats.get(k) || { req: 0, ok: 0, c403: 0, c429: 0, err: 0, ms: 0 };
     s.req++; s[field]++;
-    if (field === 'ok') s.ms = s.ms ? Math.round(s.ms * 0.7 + ms * 0.3) : ms; // EMA latency
+    if (field === 'ok') s.ms = s.ms ? Math.round(s.ms * 0.7 + ms * 0.3) : ms;
     stats.set(k, s);
   }
 
-  // rank: alive 403-bypassers first, then by fewest 403s, then by speed
   function rankProxies(proxies) {
     return [...proxies].sort((a, b) => {
       const sa = getStats(a), sb = getStats(b);
@@ -141,7 +188,13 @@ export function initEngine({ require, fetch = globalThis.fetch }) {
     return agentCache.get(proxyUrl);
   }
 
-  // ═══ BACK-COMPAT: single dispatcher (same shape as before) ════════
+  // small helper: safe body snippet without throwing
+  async function bodySnip(res, n = 120) {
+    try { const t = await res.text(); return t.replace(/\s+/g, ' ').slice(0, n); }
+    catch { return '(body unreadable)'; }
+  }
+
+  // ═══ BACK-COMPAT: single dispatcher ═══════════════════════════════
   async function getProxyDispatcher() {
     const candidates = await orderedCandidates(true);
     if (!candidates.length) {
@@ -153,51 +206,63 @@ export function initEngine({ require, fetch = globalThis.fetch }) {
     return { agent: getAgent(proxy.url), proxyIp: proxy.ip || 'Unknown IP' };
   }
 
-  // ═══ CORE: proxyFetch with 403 ROTATION + LOGGING ═════════════════
+  // ═══ CORE: proxyFetch with 403 ROTATION + TRAIL + LOGGING ═════════
   async function proxyFetch(url, options = {}, label = 'req') {
     const targetHost = (() => { try { return new URL(url).host; } catch { return url.slice(0, 40); } })();
+    const trail = Array.isArray(options._trail) ? options._trail : null;
+    const addTrail = (line) => { if (trail) trail.push(String(line).slice(0, 300)); };
+
+    if (!ProxyAgent) {
+      addTrail('engine DEGRADED (no undici ProxyAgent) — DIRECT only');
+    }
+
     const candidates = await orderedCandidates(true);
     const total = candidates.length;
-    let lastRes = null, lastErr = null, usedIp = 'none';
+    let lastRes = null, lastErr = null, usedIp = 'none', lastSnip = '';
 
     for (let i = 0; i < Math.min(MAX_ROTATIONS, total || 1); i++) {
       const proxy = candidates[i];
       const opts = { ...options };
-      if (proxy) {
-        const agent = getAgent(proxy.url);
-        if (agent) opts.dispatcher = agent;
+      delete opts._trail;
+      if (proxy && ProxyAgent) {
+        opts.dispatcher = getAgent(proxy.url);
         usedIp = proxy.ip || proxy.url;
+      } else if (proxy) {
+        usedIp = proxy.ip || proxy.url; // degraded: can't route, but log which was skipped
       }
       const t0 = Date.now();
       try {
-        const res = await fetch(url, { ...opts, signal: opts.signal || AbortSignal.timeout(REQ_TIMEOUT_MS) });
+        const res = await routeFetch(url, { ...opts, signal: opts.signal || AbortSignal.timeout(REQ_TIMEOUT_MS) });
         const ms = Date.now() - t0;
 
-        // ── v5: CSRF-dance responses are SUCCESS, not blocks ─────────
-        // authed POST without token → 403 + X-CSRF-TOKEN = correct answer.
-        // Cloudflare/WAF challenge 403s never include x-csrf-token.
+        // ── CSRF-dance responses are SUCCESS, not blocks (v5, kept) ──
         if (res.status === 403 && res.headers.get('x-csrf-token')) {
-          if (proxy) track(proxy, 'ok', ms);
+          if (proxy && ProxyAgent) track(proxy, 'ok', ms);
           log(`✓ ${label} → ${targetHost} via ${usedIp} → HTTP 403 (CSRF token issued) — returning response`);
+          addTrail(`${usedIp} → HTTP 403 + x-csrf-token ✓ (token issued)`);
           return res;
         }
 
         if (res.status === 403 || res.status === 429) {
-          if (proxy) track(proxy, res.status === 403 ? 'c403' : 'c429', ms);
-          log(`⚠ ${label} → ${targetHost} via ${usedIp} → HTTP ${res.status} — rotating${i + 1 < MAX_ROTATIONS ? ' to next proxy' : ' (last try)'} [attempt ${i + 1}/${MAX_ROTATIONS}]`);
+          if (proxy && ProxyAgent) track(proxy, res.status === 403 ? 'c403' : 'c429', ms);
+          lastSnip = await bodySnip(res, 140);
+          log(`⚠ ${label} → ${targetHost} via ${usedIp} → HTTP ${res.status} — rotating [attempt ${i + 1}/${MAX_ROTATIONS}] body:${lastSnip}`);
+          addTrail(`${usedIp} → HTTP ${res.status}${res.status === 403 ? ' (no x-csrf-token — WAF block)' : ' (rate-limited)'} body:${lastSnip}`);
           lastRes = res;
           if (res.status === 429) await new Promise(r => setTimeout(r, ROTATE_DELAY_MS));
-          continue; // rotate
+          continue;
         }
 
-        if (proxy) track(proxy, 'ok', ms);
+        if (proxy && ProxyAgent) track(proxy, 'ok', ms);
         log(`✓ ${label} → ${targetHost} via ${usedIp} → HTTP ${res.status} (${ms}ms)${i > 0 ? ` [recovered on attempt ${i + 1}]` : ''}`);
+        addTrail(`${usedIp} → HTTP ${res.status} ✓ (${ms}ms)`);
         if (i > 0) fire403Alert(`${label} RECOVERED`, `Target \`${targetHost}\` succeeded on attempt **${i + 1}** after rotation.\nProxy: \`${usedIp}\`\nStatus: \`${res.status}\``, 65280);
         return res;
       } catch (e) {
         const ms = Date.now() - t0;
-        if (proxy) track(proxy, 'err', ms);
+        if (proxy && ProxyAgent) track(proxy, 'err', ms);
         logErr(`✗ ${label} → ${targetHost} via ${usedIp} → NETWORK ERROR: ${e.message} [attempt ${i + 1}/${MAX_ROTATIONS}]`);
+        addTrail(`${usedIp} → NETWORK ERROR: ${e.message}`);
         lastErr = e;
         await new Promise(r => setTimeout(r, ROTATE_DELAY_MS));
       }
@@ -207,31 +272,77 @@ export function initEngine({ require, fetch = globalThis.fetch }) {
     if (DIRECT_FALLBACK) {
       try {
         const t0 = Date.now();
-        const res = await fetch(url, { ...options, signal: options.signal || AbortSignal.timeout(REQ_TIMEOUT_MS) });
+        const res = await routeFetch(url, { ...options, signal: options.signal || AbortSignal.timeout(REQ_TIMEOUT_MS) });
         const ms = Date.now() - t0;
         log(`✓ ${label} → ${targetHost} via DIRECT → HTTP ${res.status} (${ms}ms) [proxy pool exhausted]`);
+        addTrail(`DIRECT → HTTP ${res.status}${(res.status === 403 && !res.headers.get('x-csrf-token')) ? ' (no x-csrf-token — this server IP is WAF-blocked)' : ''} (${ms}ms)`);
         if (!res.ok && (res.status === 403 || res.status === 429) && !res.headers.get('x-csrf-token')) {
-          fire403Alert(`${label} — ALL PROXIES 403`, `Target: \`${targetHost}\`\nTried **${Math.min(MAX_ROTATIONS, total)}** proxies (last: \`${usedIp}\`) + DIRECT.\nFinal status: \`${res.status}\`\n→ Pool may need fresh IPs.`, 16711680);
+          lastSnip = await res.clone().text().then(t => t.replace(/\s+/g, ' ').slice(0, 140)).catch(() => '');
+          addTrail(`DIRECT body: ${lastSnip || '(empty)'}`);
+          fire403Alert(`${label} — ALL PROXIES 403`, `Target: \`${targetHost}\`\nTried **${Math.min(MAX_ROTATIONS, total)}** proxies (last: \`${usedIp}\`) + DIRECT.\nFinal status: \`${res.status}\`\nBody: \`${lastSnip}\`\n→ Pool IPs may be WAF-flagged or the pool is exhausted.`,
+            16711680,
+            [{ name: 'Attempt trail', value: '```' + (trail || []).slice(-6).join('\n').slice(0, 900) + '```' }]);
         }
         return res;
       } catch (e) {
         lastErr = e;
+        addTrail(`DIRECT → NETWORK ERROR: ${e.message}`);
       }
     }
 
-    fire403Alert(`${label} — TOTAL FAILURE`, `Target: \`${targetHost}\`\nProxies tried: **${Math.min(MAX_ROTATIONS, total)}**, DIRECT: **tried**\nLast proxy: \`${usedIp}\`\nError: \`${lastErr ? lastErr.message : (lastRes ? 'HTTP ' + lastRes.status : 'unknown')}\``, 16711680);
-    throw lastErr || new Error(`${label}: all proxy routes failed for ${targetHost} (last HTTP ${lastRes?.status})`);
+    const errMsg =
+      `${label}: all ${Math.min(MAX_ROTATIONS, total)} proxy route(s) + DIRECT failed for ${targetHost}` +
+      (lastRes ? ` — last HTTP ${lastRes.status}` : '') +
+      (lastErr ? ` — last error: ${lastErr.message}` : '');
+    const err = new Error(errMsg);
+    err.attempts = trail || [];
+    fire403Alert(`${label} — TOTAL FAILURE`,
+      `Target: \`${targetHost}\`\nProxies tried: **${Math.min(MAX_ROTATIONS, total)}**, DIRECT: **tried**\nLast proxy: \`${usedIp}\`\nError: \`${lastErr ? lastErr.message : (lastRes ? 'HTTP ' + lastRes.status : 'unknown')}\``,
+      16711680,
+      [{ name: 'Attempt trail', value: '```' + (trail || []).slice(-8).join('\n').slice(0, 900) + '```' }]);
+    throw err;
   }
 
-  // ═══ 403 ALERTING (throttled per host) ════════════════════════════
-  function fire403Alert(title, desc, color) {
+  // ═══ BUILT-IN CSRF GETTER (v6) — one canonical implementation ═════
+  // POST auth.roblox.com/v2/logout with the cookie → 403 + x-csrf-token
+  // (Roblox's anti-forgery middleware answers BEFORE auth, so this works
+  //  for any cookie format; an invalid cookie yields token too but the
+  //  later ticket step will fail with 401 — never this one).
+  async function getCsrfToken(cookieToken, label = 'CSRF') {
+    const trail = [];
+    try {
+      const res = await proxyFetch('https://auth.roblox.com/v2/logout', {
+        method: 'POST',
+        headers: {
+          'Cookie': `.ROBLOSECURITY=${cookieToken}`,
+          'User-Agent': BROWSER_UA,
+          'Accept': 'application/json'
+        },
+        _trail: trail
+      }, label);
+      const tok = res.headers.get('x-csrf-token');
+      if (tok) return { ok: true, token: tok, status: res.status, attempts: trail };
+      let snip = '';
+      try { snip = (await res.text()).replace(/\s+/g, ' ').slice(0, 160); } catch {}
+      trail.push(`final response HTTP ${res.status} had NO x-csrf-token; body: ${snip || '(empty)'}`);
+      return { ok: false, token: null, status: res.status, attempts: trail };
+    } catch (e) {
+      const list = Array.isArray(e.attempts) && e.attempts.length ? e.attempts : [e.message];
+      trail.push(...list);
+      return { ok: false, token: null, status: null, attempts: trail, error: e.message };
+    }
+  }
+
+  // ═══ 403 ALERTING (throttled per key) ═════════════════════════════
+  function fire403Alert(title, desc, color, fields = []) {
     const now = Date.now();
     const key = title.split('—')[0].trim();
     if (now - (lastAlertAt.get(key) || 0) < ALERT_COOLDOWN) return;
     lastAlertAt.set(key, now);
     sendDiscordLog(title, desc, color, [
-      { name: 'Engine', value: 'Proxy Rotation v5', inline: true },
-      { name: 'Pool Size', value: String(poolCache.proxies.length), inline: true }
+      { name: 'Engine', value: 'Proxy Rotation v6', inline: true },
+      { name: 'Pool Size', value: String(poolCache.proxies.length), inline: true },
+      ...fields
     ]);
   }
 
@@ -244,7 +355,7 @@ export function initEngine({ require, fetch = globalThis.fetch }) {
           title: `🔴 [Live Log] ${title}`,
           description: String(desc).slice(0, 4000),
           color: color,
-          fields: fields,
+          fields: Array.isArray(fields) ? fields : [],
           timestamp: new Date().toISOString()
         }]
       };
@@ -254,13 +365,13 @@ export function initEngine({ require, fetch = globalThis.fetch }) {
         body: JSON.stringify(payload)
       });
       const text = await res.text();
-      console.log('[DISCORD LOG STATUS]', res.status, text);
+      console.log('[DISCORD LOG STATUS]', res.status, text.slice(0, 120));
     } catch (e) {
       console.error('[DISCORD LOG EXCEPTION]', e.message);
     }
   }
 
-  // ═══ ANALYTICS REPORT (per-IP stats to Discord) ═══════════════════
+  // ═══ ANALYTICS REPORT ═════════════════════════════════════════════
   async function sendProxyAnalyticsReport() {
     if (!stats.size) { log('Analytics: no requests tracked yet — skipping report.'); return; }
     const rows = [...stats.entries()]
@@ -288,6 +399,7 @@ export function initEngine({ require, fetch = globalThis.fetch }) {
             color: 3447003,
             fields: [
               { name: '📦 Pool Size', value: `\`${poolCache.proxies.length}\` proxies loaded`, inline: true },
+              { name: '🛣️ Route fetch', value: `\`${undiciSource}\``, inline: true },
               { name: '📈 Total Requests', value: `\`${totals.req}\``, inline: true },
               { name: '✅ Success', value: `\`${totals.ok}\` (${totals.req ? Math.round(totals.ok / totals.req * 100) : 0}%)`, inline: true },
               { name: '🚫 403 Blocked', value: `\`${totals.c403}\``, inline: true },
@@ -296,7 +408,7 @@ export function initEngine({ require, fetch = globalThis.fetch }) {
               ...rows
             ],
             timestamp: new Date().toISOString(),
-            footer: { text: 'Proxy Rotation Engine v5 • 403-aware • CSRF-aware' }
+            footer: { text: 'Proxy Rotation Engine v6 • vercel-proof • real-error reporting' }
           }]
         })
       });
@@ -306,5 +418,5 @@ export function initEngine({ require, fetch = globalThis.fetch }) {
     }
   }
 
-  return { proxyFetch, sendDiscordLog, sendProxyAnalyticsReport, getProxyDispatcher };
+  return { proxyFetch, getCsrfToken, sendDiscordLog, sendProxyAnalyticsReport, getProxyDispatcher };
 }
