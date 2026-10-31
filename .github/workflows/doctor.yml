@@ -1,13 +1,14 @@
 name: Pool Doctor
 
-# Runs every 30 min + manual "Run workflow" button (mobile-friendly).
-# Sends ONE health-report embed to your Discord each run AND
+# Runs every 2 hours + manual "Run workflow" button (mobile-friendly).
+# Sends ONE health-report embed to your Discord each run WITH REAL ERROR
+# TEXT (exception messages + response bodies, not just "blocked"), AND
 # auto-prunes dead IPs: marks them alive:false in proxies.json and
 # commits the update -> every tool stops using dead IPs within 60s.
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '0 */2 * * *'   # every 2 hours
   workflow_dispatch: {}
 
 # needed so the doctor can commit the pruned proxies.json back
